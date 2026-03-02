@@ -719,7 +719,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           enabled: true,
           dmPolicy: "pairing",
           botToken: payload.telegramToken.trim(),
-          groupPolicy: "allowlist",
+          groupPolicy: "open",
           streamMode: "partial",
         });
       }
@@ -728,7 +728,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         extra += await configureChannel("discord", {
           enabled: true,
           token: payload.discordToken.trim(),
-          groupPolicy: "allowlist",
+          groupPolicy: "open",
           dm: { policy: "pairing" },
         });
       }
