@@ -190,33 +190,39 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+async function probeGatewayOnce() {
+  const endpoints = ["/openclaw", "/", "/health"];
+
+  for (const endpoint of endpoints) {
+    try {
+      const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
+        method: "GET",
+      });
+      if (res) {
+        return { ok: true, endpoint };
+      }
+    } catch (err) {
+      if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
+        const msg = err.code || err.message;
+        if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
+          log.warn("gateway", `health check error: ${msg}`);
+        }
+      }
+    }
+  }
+
+  return { ok: false, endpoint: null };
+}
+
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const start = Date.now();
-  const endpoints = ["/openclaw", "/", "/health"];
 
   while (Date.now() - start < timeoutMs) {
-    if (!gatewayProc) {
-      log.error("gateway", "process exited during readiness check");
-      return false;
-    }
-    for (const endpoint of endpoints) {
-      try {
-        const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
-          method: "GET",
-        });
-        if (res) {
-          log.info("gateway", `ready at ${endpoint}`);
-          return true;
-        }
-      } catch (err) {
-        if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
-          const msg = err.code || err.message;
-          if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
-            log.warn("gateway", `health check error: ${msg}`);
-          }
-        }
-      }
+    const probe = await probeGatewayOnce();
+    if (probe.ok) {
+      log.info("gateway", `ready at ${probe.endpoint}`);
+      return true;
     }
     await sleep(250);
   }
@@ -283,12 +289,24 @@ async function startGateway() {
       }
       const delay = Math.min(2000 * Math.pow(2, gatewayRestartCount), 60_000);
       log.info("gateway", `scheduling auto-restart in ${delay / 1000}s (attempt ${gatewayRestartCount}, uptime ${Math.round(uptime / 1000)}s)...`);
-      setTimeout(() => {
-        if (!shuttingDown && !gatewayProc && isConfigured()) {
-          ensureGatewayRunning().catch((err) => {
-            log.error("gateway", `auto-restart failed: ${err.message}`);
-          });
+      setTimeout(async () => {
+        if (shuttingDown || gatewayProc || !isConfigured()) {
+          return;
         }
+
+        const probe = await probeGatewayOnce();
+        if (probe.ok) {
+          log.info(
+            "gateway",
+            `gateway still reachable at ${probe.endpoint}; assuming OpenClaw restarted itself`,
+          );
+          gatewayRestartCount = 0;
+          return;
+        }
+
+        ensureGatewayRunning().catch((err) => {
+          log.error("gateway", `auto-restart failed: ${err.message}`);
+        });
       }, delay);
     }
   });
@@ -297,6 +315,10 @@ async function startGateway() {
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
+  const probe = await probeGatewayOnce();
+  if (probe.ok) {
+    return { ok: true, reason: "reachable" };
+  }
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       await syncAllowedOrigins();
@@ -333,6 +355,7 @@ async function restartGateway() {
     gatewayProc = null;
     intentionalRestart = false;
   }
+  await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
   gatewayRestartCount = 0;
   return ensureGatewayRunning();
 }
@@ -1525,6 +1548,13 @@ async function gracefulShutdown(signal) {
     } catch (err) {
       log.warn("wrapper", `error killing gateway: ${err.message}`);
     }
+  }
+
+  try {
+    const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+    log.info("wrapper", `gateway stop during shutdown exit=${stopResult.code}`);
+  } catch (err) {
+    log.warn("wrapper", `gateway stop during shutdown failed: ${err.message}`);
   }
 
   process.exit(0);
